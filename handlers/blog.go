@@ -10,9 +10,13 @@ import (
     "log"
     "net/http"
     "os"
+    "path"
+    "regexp"
     "strings"
     "time"
 )
+
+var slugPattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
 func BlogHandler(_ context.Context, rw gemax.ResponseWriter, req gemax.IncomingRequest) {
     err := logRequest(req)
@@ -20,10 +24,8 @@ func BlogHandler(_ context.Context, rw gemax.ResponseWriter, req gemax.IncomingR
         log.Println(err)
     }
 
-    urlPath := req.URL().Path
+    urlPath := path.Clean("/" + req.URL().Path)
     urlPath = strings.TrimPrefix(urlPath, "/")
-    urlPath = strings.TrimSuffix(urlPath, "/")
-    urlPath = strings.ReplaceAll(urlPath, "/../", "/")
     if urlPath == "" {
         handleIndex(rw)
         return
@@ -46,9 +48,8 @@ func BlogHandler(_ context.Context, rw gemax.ResponseWriter, req gemax.IncomingR
         return
     }
 
-    reqUrl := config.BlogHost + req.URL().Path
-    if isImageURL(urlPath) {
-        handleFileProxy(reqUrl, rw, req)
+    if isFileURL(urlPath) {
+        handleFileProxy(config.BlogApiHost+"/"+urlPath, rw, req)
         return
     }
 
@@ -87,14 +88,22 @@ func logRequest(request gemax.IncomingRequest) error {
     return nil
 }
 
-func handlePostProxy(reqUrl string, rw gemax.ResponseWriter, req gemax.IncomingRequest) {
-    postText, err := services.GetGhostPost(reqUrl)
-    if err == nil {
-        io.WriteString(rw, postText)
+func handlePostProxy(urlPath string, rw gemax.ResponseWriter, req gemax.IncomingRequest) {
+    // posts are requested by their slug, which is the last part of the path
+    // even when the blog uses dated or prefixed permalinks
+    slug := path.Base(urlPath)
+    if !slugPattern.MatchString(slug) {
+        rw.WriteStatus(status.NotFound, "Not found: "+req.URL().Path)
         return
     }
 
-    pageText, err := services.GetGhostPage(reqUrl)
+    postText, err := services.GetGhostPost(slug)
+    if err == nil {
+        io.WriteString(rw, postText+config.TextFooter)
+        return
+    }
+
+    pageText, err := services.GetGhostPage(slug)
     if err == nil {
         io.WriteString(rw, pageText+config.TextFooter)
         return
@@ -104,14 +113,20 @@ func handlePostProxy(reqUrl string, rw gemax.ResponseWriter, req gemax.IncomingR
 }
 
 func handleFileProxy(reqUrl string, rw gemax.ResponseWriter, req gemax.IncomingRequest) {
-    file, err := services.ProxyFile(reqUrl)
+    resp, err := services.ProxyFile(reqUrl)
     if err != nil {
         log.Println(err)
         rw.WriteStatus(status.NotFound, "Not found: "+req.URL().Path)
+        return
     }
-    contentType := http.DetectContentType(file)
+    defer resp.Body.Close()
+
+    contentType := resp.Header.Get("Content-Type")
+    if contentType == "" {
+        contentType = "application/octet-stream"
+    }
     rw.WriteStatus(status.Success, contentType)
-    _, err = rw.Write(file)
+    _, err = io.Copy(rw, resp.Body)
     if err != nil {
         log.Println(err)
     }
@@ -130,8 +145,17 @@ func handleIndex(rw gemax.ResponseWriter) {
     io.WriteString(rw, geminiContent+config.TextFooter)
 }
 
-func isImageURL(urlPath string) bool {
-    suffixes := []string{".jpg", ".jpeg", ".webp", ".png", ".gif"}
+// isFileURL reports whether the path is a file stored by Ghost: images, media and
+// files of the editor cards are kept in the content directory
+func isFileURL(urlPath string) bool {
+    prefixes := []string{"content/images/", "content/media/", "content/files/"}
+    for _, prefix := range prefixes {
+        if strings.HasPrefix(urlPath, prefix) {
+            return true
+        }
+    }
+
+    suffixes := []string{".jpg", ".jpeg", ".webp", ".png", ".gif", ".svg", ".avif"}
     lowerUrlPath := strings.ToLower(urlPath)
     for _, suffix := range suffixes {
         if strings.HasSuffix(lowerUrlPath, suffix) {

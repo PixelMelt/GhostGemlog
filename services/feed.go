@@ -5,9 +5,8 @@ import (
     "fmt"
     "ghost2gemini/models"
     "ghost2gemini/models/config"
-    "io/ioutil"
-    "net/url"
     "os"
+    "path/filepath"
 )
 
 const jsonFilePath = "data/blog/posts.json"
@@ -18,41 +17,27 @@ func SaveFeed() error {
         return err
     }
 
-    existingItemsMap := make(map[string]models.FeedItem)
-    existingFeed, _ := readRssFromJson()
-    for _, item := range existingFeed.Channel.Items {
-        existingItemsMap[item.Guid] = item
-    }
-
-    for _, item := range rssFeed.Channel.Items {
-        existingItemsMap[item.Guid] = item
-    }
-
-    newItems := make([]models.FeedItem, 0, len(existingItemsMap))
-    for _, item := range existingItemsMap {
-        newItems = append(newItems, item)
-    }
-    rssFeed.Channel.Items = newItems
-
+    // the whole list of posts is requested from the blog,
+    // so posts that were deleted or unpublished disappear from the capsule too
     rssFeed.Channel.SortItemsByPubDate()
-
-    file, err := os.Create(jsonFilePath)
-    if err != nil {
-        return err
-    }
-    defer file.Close()
 
     jsonData, err := json.MarshalIndent(rssFeed, "", "  ")
     if err != nil {
         return err
     }
 
-    _, err = file.Write(jsonData)
+    err = os.MkdirAll(filepath.Dir(jsonFilePath), 0755)
     if err != nil {
         return err
     }
 
-    return nil
+    tmpFilePath := jsonFilePath + ".tmp"
+    err = os.WriteFile(tmpFilePath, jsonData, 0644)
+    if err != nil {
+        return err
+    }
+
+    return os.Rename(tmpFilePath, jsonFilePath)
 }
 
 func GetFeedAsGemini() (string, error) {
@@ -68,12 +53,11 @@ func GetFeedAsGemini() (string, error) {
         config.TextDescription,
     )
     for _, item := range rssFeed.Channel.Items {
-        postLink, _ := url.Parse(item.Link)
         geminiContent += fmt.Sprintf(
-            "### %s\n\n%s\n\n=> %s %s | %s\n\n",
+            "### %s\n\n%s\n\n=> /%s/ %s | %s\n\n",
             item.Title,
             item.Description,
-            postLink.Path,
+            item.Link,
             item.PubDate,
             config.TextRead,
         )
@@ -83,16 +67,16 @@ func GetFeedAsGemini() (string, error) {
 }
 
 func readRssFromJson() (*models.Feed, error) {
-    file, err := os.Open(jsonFilePath)
+    byteValue, err := os.ReadFile(jsonFilePath)
     if err != nil {
         return nil, err
     }
-    defer file.Close()
-    byteValue, err := ioutil.ReadAll(file)
-    if err != nil {
-        return nil, err
-    }
+
     var rssFeed models.Feed
     err = json.Unmarshal(byteValue, &rssFeed)
-    return &rssFeed, err
+    if err != nil {
+        return nil, err
+    }
+
+    return &rssFeed, nil
 }

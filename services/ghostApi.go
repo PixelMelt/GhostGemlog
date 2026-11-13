@@ -1,22 +1,27 @@
 package services
 
 import (
-    "bytes"
     "encoding/json"
     "errors"
     "fmt"
     "ghost2gemini/models"
     "ghost2gemini/models/config"
-    "github.com/LukeEmmet/html2gemini"
-    "golang.org/x/net/html"
     "io"
     "net/http"
+    "net/url"
+    "strconv"
     "strings"
     "time"
 )
 
+// Ghost 6 no longer accepts limit=all and caps page size at 100
+const ghostPageLimit = 100
+const ghostApiVersion = "v6.0"
+
+var httpClient = &http.Client{Timeout: 30 * time.Second}
+
 func GetGhostPost(slug string) (string, error) {
-    rawPost, err := getFromApi("posts/slug/" + slug)
+    rawPost, err := getFromApi("posts/slug/"+slug, nil)
     if err != nil {
         return "", err
     }
@@ -31,7 +36,7 @@ func GetGhostPost(slug string) (string, error) {
 }
 
 func GetGhostPage(slug string) (string, error) {
-    rawPage, err := getFromApi("pages/slug/" + slug)
+    rawPage, err := getFromApi("pages/slug/"+slug, nil)
     if err != nil {
         return "", err
     }
@@ -46,18 +51,7 @@ func GetGhostPage(slug string) (string, error) {
 }
 
 func GetGhostPostList() (*models.Feed, error) {
-    rawPosts, err := getFromApi("posts")
-    if err != nil {
-        return nil, err
-    }
-
-    var posts models.GhostPosts
-    err = json.Unmarshal(rawPosts, &posts)
-    if err != nil {
-        return nil, err
-    }
-
-    rawSettings, err := getFromApi("settings/")
+    rawSettings, err := getFromApi("settings", nil)
     if err != nil {
         return nil, err
     }
@@ -73,23 +67,49 @@ func GetGhostPostList() (*models.Feed, error) {
             Title:       settings.Content.Title,
             Link:        settings.Content.Url,
             Description: settings.Content.Description,
-            Items:       make([]models.FeedItem, 0, len(posts.Posts)),
+            Items:       make([]models.FeedItem, 0),
         },
     }
 
-    for _, post := range posts.Posts {
-        parsedTime, _ := time.Parse(time.RFC3339, post.PubDate)
-        pubDate := parsedTime.UTC().Format("Mon, 02 Jan 2006 15:04:05 GMT")
+    params := url.Values{}
+    params.Set("limit", strconv.Itoa(ghostPageLimit))
+    params.Set("filter", "visibility:public")
+    params.Set("fields", "id,title,slug,excerpt,custom_excerpt,published_at")
 
-        item := models.FeedItem{
-            Title:       post.Title,
-            Link:        post.Slug,
-            Description: post.Exceprt,
-            PubDate:     pubDate,
-            Guid:        post.Id,
+    page := 1
+    for page > 0 {
+        params.Set("page", strconv.Itoa(page))
+        rawPosts, err := getFromApi("posts", params)
+        if err != nil {
+            return nil, err
         }
 
-        feed.Channel.Items = append(feed.Channel.Items, item)
+        var posts models.GhostPosts
+        err = json.Unmarshal(rawPosts, &posts)
+        if err != nil {
+            return nil, err
+        }
+
+        for _, post := range posts.Posts {
+            parsedTime, _ := time.Parse(time.RFC3339, post.PubDate)
+            pubDate := parsedTime.UTC().Format("Mon, 02 Jan 2006 15:04:05 GMT")
+
+            item := models.FeedItem{
+                Title:       post.Title,
+                Link:        post.Slug,
+                Description: post.Exceprt,
+                PubDate:     pubDate,
+                Guid:        post.Id,
+            }
+
+            feed.Channel.Items = append(feed.Channel.Items, item)
+        }
+
+        // next is null on the last page
+        if posts.Meta.Pagination.Next <= page {
+            break
+        }
+        page = posts.Meta.Pagination.Next
     }
 
     return &feed, nil
@@ -130,9 +150,36 @@ func parseGhostItem(posts []models.GhostItem) (string, error) {
     return "# " + post.Title + excerpt + image + imageCaption + "\n\n" + postText, nil
 }
 
-func getFromApi(method string) ([]byte, error) {
-    url := config.BlogHost + "/ghost/api/content/" + method + "?key=" + config.BlogKey
-    resp, err := http.Get(url)
+func newBlogRequest(reqUrl string) (*http.Request, error) {
+    req, err := http.NewRequest(http.MethodGet, reqUrl, nil)
+    if err != nil {
+        return nil, err
+    }
+
+    // Ghost redirects plain http requests to its public https url
+    // unless a proxy says the original request was secure
+    if strings.HasPrefix(config.BlogHost, "https://") && strings.HasPrefix(config.BlogApiHost, "http://") {
+        req.Header.Set("X-Forwarded-Proto", "https")
+    }
+
+    return req, nil
+}
+
+func getFromApi(method string, params url.Values) ([]byte, error) {
+    if params == nil {
+        params = url.Values{}
+    }
+    params.Set("key", config.BlogKey)
+
+    // Ghost answers requests without a trailing slash with a redirect
+    reqUrl := config.BlogApiHost + "/ghost/api/content/" + strings.Trim(method, "/") + "/?" + params.Encode()
+    req, err := newBlogRequest(reqUrl)
+    if err != nil {
+        return nil, err
+    }
+    req.Header.Set("Accept-Version", ghostApiVersion)
+
+    resp, err := httpClient.Do(req)
     if err != nil {
         return nil, err
     }
@@ -143,62 +190,14 @@ func getFromApi(method string) ([]byte, error) {
         return nil, err
     }
 
+    if resp.StatusCode != http.StatusOK {
+        var apiErrors models.GhostErrors
+        message := resp.Status
+        if json.Unmarshal(respBody, &apiErrors) == nil && len(apiErrors.Errors) > 0 {
+            message = apiErrors.Errors[0].Message
+        }
+        return nil, fmt.Errorf("ghost api %s returned status %d: %s", method, resp.StatusCode, message)
+    }
+
     return respBody, nil
-}
-
-func htmlToGemini(html string) (string, error) {
-    html, _ = replaceTags(html, "s", config.TextStrikeTag)
-    html, _ = replaceTags(html, "strike", config.TextStrikeTag)
-    html = strings.ReplaceAll(html, "</p>", "</p><br><br>")
-    html = strings.ReplaceAll(html, "</div>", "</div><br><br>")
-
-    options := html2gemini.NewOptions()
-    options.CitationStart = 4
-    options.LinkEmitFrequency = 1
-    options.CitationMarkers = true
-    options.NumberedLinks = true
-    options.EmitImagesAsLinks = true
-    options.ImageMarkerPrefix = "🖼️"
-
-    options.PrettyTables = false
-    options.PrettyTablesOptions.HeaderLine = true
-    options.PrettyTablesOptions.RowLine = true
-    options.PrettyTablesOptions.CenterSeparator = " "
-    options.PrettyTablesOptions.ColumnSeparator = " "
-    options.PrettyTablesOptions.RowSeparator = " "
-
-    ctx := html2gemini.NewTraverseContext(*options)
-
-    text, err := html2gemini.FromString(html, *ctx)
-    if err != nil {
-        return "", err
-    }
-
-    text = strings.ReplaceAll(text, "=> "+config.BlogHost, "=> ")
-
-    return text, nil
-}
-
-func replaceTags(input string, from string, to string) (string, error) {
-    doc, err := html.Parse(strings.NewReader(input))
-    if err != nil {
-        return "", err
-    }
-
-    var traverse func(*html.Node)
-    traverse = func(n *html.Node) {
-        if n.Type == html.ElementNode && n.Data == from {
-            n.Data = to
-        }
-        for c := n.FirstChild; c != nil; c = c.NextSibling {
-            traverse(c)
-        }
-    }
-    traverse(doc)
-
-    var buf bytes.Buffer
-    if err := html.Render(&buf, doc); err != nil {
-        return "", err
-    }
-    return buf.String(), nil
 }

@@ -13,8 +13,19 @@ type GhostItem struct {
     Slug                string `json:"slug"`
 }
 
+type GhostPagination struct {
+    Page  int `json:"page"`
+    Pages int `json:"pages"`
+    Next  int `json:"next"`
+}
+
+type GhostMeta struct {
+    Pagination GhostPagination `json:"pagination"`
+}
+
 type GhostPosts struct {
     Posts []GhostItem `json:"posts"`
+    Meta  GhostMeta   `json:"meta"`
 }
 
 type GhostPages struct {
@@ -29,4 +40,13 @@ type GhostSettingsContent struct {
     Title       string `json:"title"`
     Description string `json:"description"`
     Url         string `json:"url"`
+}
+
+type GhostError struct {
+    Message string `json:"message"`
+    Type    string `json:"type"`
+}
+
+type GhostErrors struct {
+    Errors []GhostError `json:"errors"`
 }
