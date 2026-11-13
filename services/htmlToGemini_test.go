@@ -60,6 +60,39 @@ func TestCodeCard(t *testing.T) {
     }
 }
 
+func TestImageCard(t *testing.T) {
+    config.BlogHost = "https://blog.example.com"
+    defer func() { config.BlogHost = "" }()
+
+    input := `<p>Before the image.</p><figure class="kg-card kg-image-card kg-card-hascaption"><img src="https://blog.example.com/content/images/2025/06/image.png" class="kg-image" alt="" loading="lazy" width="640" height="122"><figcaption><span style="white-space: pre-wrap;">Text content</span></figcaption></figure><figure class="kg-card kg-image-card"><img src="https://blog.example.com/content/images/2025/06/image-1.png" class="kg-image" alt="" loading="lazy"></figure><p>After the image.</p>`
+    expected := "Before the image.\n\n=> /content/images/2025/06/image.png 🖼️ Text content\n\n=> /content/images/2025/06/image-1.png 🖼️ image-1\n\nAfter the image."
+
+    text, err := htmlToGemini(input)
+    if err != nil {
+        t.Fatal(err)
+    }
+
+    if text != expected {
+        t.Errorf("image cards are not links on their own lines:\n%s", text)
+    }
+}
+
+func TestImageCaptionWithLink(t *testing.T) {
+    input := `<figure class="kg-card kg-image-card kg-card-hascaption"><img src="https://images.example.com/photo.jpg" class="kg-image" alt="A cat"><figcaption><span style="white-space: pre-wrap;">Photo by </span><a href="https://example.com/author"><span style="white-space: pre-wrap;">Author</span></a></figcaption></figure>`
+
+    text, err := htmlToGemini(input)
+    if err != nil {
+        t.Fatal(err)
+    }
+
+    if !strings.HasPrefix(text, "=> https://images.example.com/photo.jpg 🖼️ Photo by Author\n") {
+        t.Errorf("image is not a link line:\n%s", text)
+    }
+    if !strings.Contains(text, "https://example.com/author") {
+        t.Errorf("link of the caption is lost:\n%s", text)
+    }
+}
+
 func TestLinksToBlogAreRelative(t *testing.T) {
     config.BlogHost = "https://blog.example.com"
     defer func() { config.BlogHost = "" }()

@@ -5,6 +5,7 @@ import (
     "fmt"
     "ghost2gemini/models/config"
     "net/url"
+    "path"
     "regexp"
     "strings"
 
@@ -13,7 +14,7 @@ import (
     "golang.org/x/net/html/atom"
 )
 
-const codeBlockPlaceholder = "GHOSTGEMLOGCODEBLOCK%dEND"
+const rawBlockPlaceholder = "GHOSTGEMLOGRAWBLOCK%dEND"
 
 // html2gemini puts several spaces between the address and the name of a link
 var linkSpacingPattern = regexp.MustCompile(`(?m)^=> (\S+) {2,}`)
@@ -24,7 +25,7 @@ func htmlToGemini(input string) (string, error) {
         return "", err
     }
 
-    codeBlocks := prepareGhostHtml(doc)
+    rawBlocks := prepareGhostHtml(doc)
 
     var buf bytes.Buffer
     if err := html.Render(&buf, doc); err != nil {
@@ -59,16 +60,17 @@ func htmlToGemini(input string) (string, error) {
     text = strings.ReplaceAll(text, "=> "+config.BlogHost, "=> ")
     text = linkSpacingPattern.ReplaceAllString(text, "=> $1 ")
 
-    for i, codeBlock := range codeBlocks {
-        text = strings.Replace(text, fmt.Sprintf(codeBlockPlaceholder, i), codeBlock, 1)
+    for i, rawBlock := range rawBlocks {
+        text = strings.Replace(text, fmt.Sprintf(rawBlockPlaceholder, i), rawBlock, 1)
     }
 
     return text, nil
 }
 
 // prepareGhostHtml rewrites the cards of the Ghost editor that html2gemini can't
-// display into plain html. Code blocks are cut out and returned separately,
-// because html2gemini strips their indentation and blank lines.
+// display into plain html. Code blocks and images are cut out and returned
+// separately as ready gemtext: html2gemini strips indentation and blank lines of
+// the code, and glues images and their captions to the text around them.
 func prepareGhostHtml(doc *html.Node) []string {
     var nodes []*html.Node
     var collect func(*html.Node)
@@ -82,7 +84,7 @@ func prepareGhostHtml(doc *html.Node) []string {
     }
     collect(doc)
 
-    codeBlocks := make([]string, 0)
+    rawBlocks := make([]string, 0)
     for _, n := range nodes {
         if isDetached(n, doc) {
             continue
@@ -95,8 +97,8 @@ func prepareGhostHtml(doc *html.Node) []string {
                 n.DataAtom = 0
             }
         case n.Data == "pre":
-            placeholder := fmt.Sprintf(codeBlockPlaceholder, len(codeBlocks))
-            codeBlocks = append(codeBlocks, codeBlockToGemini(n))
+            placeholder := fmt.Sprintf(rawBlockPlaceholder, len(rawBlocks))
+            rawBlocks = append(rawBlocks, codeBlockToGemini(n))
             replaceNode(n, newParagraph(placeholder))
         case n.Data == "iframe":
             src := embedToLink(getAttr(n, "src"))
@@ -162,10 +164,49 @@ func prepareGhostHtml(doc *html.Node) []string {
         case hasClass(n, "kg-signup-card"):
             // member signup forms make no sense outside of the web
             removeNode(n)
+        case n.Data == "figure":
+            // image and gallery cards: every image is a link on its own line
+            images := findNodes(n, func(c *html.Node) bool { return c.Data == "img" && getAttr(c, "src") != "" })
+            if len(images) == 0 {
+                continue
+            }
+            caption := findNode(n, func(c *html.Node) bool { return c.Data == "figcaption" })
+            captionText := ""
+            if caption != nil {
+                captionText = strings.Join(strings.Fields(rawText(caption)), " ")
+            }
+
+            lines := make([]string, 0, len(images))
+            for _, image := range images {
+                label := captionText
+                if label == "" || len(images) > 1 {
+                    label = imageLabel(image)
+                }
+                src := strings.TrimPrefix(getAttr(image, "src"), config.BlogHost)
+                lines = append(lines, "=> "+src+" 🖼️ "+label)
+            }
+
+            placeholder := fmt.Sprintf(rawBlockPlaceholder, len(rawBlocks))
+            rawBlocks = append(rawBlocks, strings.Join(lines, "\n"))
+            replacement := []*html.Node{newParagraph(placeholder)}
+            // the caption is kept as text when it isn't the name of the only link
+            // or when it has links of its own
+            hasLinks := caption != nil && findNode(caption, func(c *html.Node) bool { return c.Data == "a" }) != nil
+            if caption != nil && (len(images) > 1 || hasLinks) {
+                removeNode(caption)
+                paragraph := &html.Node{Type: html.ElementNode, Data: "p", DataAtom: atom.P}
+                for caption.FirstChild != nil {
+                    child := caption.FirstChild
+                    caption.RemoveChild(child)
+                    paragraph.AppendChild(child)
+                }
+                replacement = append(replacement, paragraph)
+            }
+            replaceNode(n, replacement...)
         }
     }
 
-    return codeBlocks
+    return rawBlocks
 }
 
 func codeBlockToGemini(pre *html.Node) string {
@@ -238,6 +279,30 @@ func findNode(n *html.Node, match func(*html.Node) bool) *html.Node {
         }
     }
     return nil
+}
+
+func findNodes(n *html.Node, match func(*html.Node) bool) []*html.Node {
+    var found []*html.Node
+    for c := n.FirstChild; c != nil; c = c.NextSibling {
+        if c.Type == html.ElementNode && match(c) {
+            found = append(found, c)
+        }
+        found = append(found, findNodes(c, match)...)
+    }
+    return found
+}
+
+// imageLabel names an image by its alt text or, when there is none, by its file
+func imageLabel(image *html.Node) string {
+    if alt := strings.TrimSpace(getAttr(image, "alt")); alt != "" {
+        return alt
+    }
+    src := getAttr(image, "src")
+    if parsed, err := url.Parse(src); err == nil {
+        src = parsed.Path
+    }
+    fileName := path.Base(src)
+    return strings.TrimSuffix(fileName, path.Ext(fileName))
 }
 
 func rawText(n *html.Node) string {
